@@ -200,10 +200,11 @@ def run_batch(raw: str, delay: float = 0.2) -> int:
         status = "OK   " if conf >= CONFIDENCE_THRESHOLD else "CHECK"
         if status.strip() != "OK":
             flagged += 1
+        doi_url = f"https://doi.org/{doi}" if doi != "(no DOI)" else doi
         print(f"[{i}] {status}  conf {conf:.0%}  score {score:.0f}")
         print(f"    in:  {reference[:90]}")
         print(f"    hit: {title[:90]}")
-        print(f"    doi: {doi}\n")
+        print(f"    doi: {doi_url}\n")
 
         if delay and i < len(references):
             time.sleep(delay)
