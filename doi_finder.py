@@ -21,7 +21,7 @@ import requests
 
 CROSSREF_URL = "https://api.crossref.org/works"
 # Used for the Crossref "polite pool" — identifies us as a well-behaved client.
-CONTACT_EMAIL = "your-email@example.com"
+CONTACT_EMAIL = "hw@iki.fi"
 USER_AGENT = f"doi-finder/0.1 (mailto:{CONTACT_EMAIL})"
 
 # A reference entry starts with an author surname: a capitalized word, a comma,
@@ -74,12 +74,15 @@ def split_references(text: str) -> list[str]:
     return entries
 
 
-def find_doi(reference: str, rows: int = 5, timeout: int = 30) -> dict | None:
-    """Query Crossref for a reference and return the best-matching work, or None."""
+def find_doi(reference: str, rows: int = 5, timeout: int = 30) -> list[dict]:
+    """Query Crossref for a reference and return the candidate works (best first).
+
+    Returns Crossref's own relevance order; callers re-rank with pick_best.
+    """
     params = {
         "query.bibliographic": reference,
         "rows": rows,
-        "select": "DOI,title,author,issued,container-title,score",
+        "select": "DOI,title,author,issued,container-title,score,type",
         "mailto": CONTACT_EMAIL,
     }
     resp = requests.get(
@@ -89,8 +92,12 @@ def find_doi(reference: str, rows: int = 5, timeout: int = 30) -> dict | None:
         timeout=timeout,
     )
     resp.raise_for_status()
-    items = resp.json().get("message", {}).get("items", [])
-    return items[0] if items else None
+    return resp.json().get("message", {}).get("items", [])
+
+
+def _words(text: str) -> set[str]:
+    """Lowercased word tokens, keeping accented letters (e.g. "Lähteenaho") whole."""
+    return set(re.findall(r"\w+", text.lower()))
 
 
 def title_confidence(reference: str, work: dict) -> float:
@@ -100,13 +107,78 @@ def title_confidence(reference: str, work: dict) -> float:
     should share most of its title words with what we searched for. Robust to
     the word-order and punctuation noise typical of PDF paste.
     """
-    title = (work.get("title") or [""])[0].lower()
-    title_words = {w for w in re.findall(r"[a-z0-9]+", title) if len(w) > 3}
+    title_words = {w for w in _words((work.get("title") or [""])[0]) if len(w) > 3}
     if not title_words:
         return 0.0
-    ref_words = set(re.findall(r"[a-z0-9]+", reference.lower()))
+    ref_words = _words(reference)
     hits = sum(1 for w in title_words if w in ref_words)
     return hits / len(title_words)
+
+
+def author_overlap(reference: str, work: dict) -> float | None:
+    """Fraction of the record's author family names that appear in the reference.
+
+    Discriminates a work from things that merely *mention* it: a book review's
+    title embeds the book's title and authors (high title overlap), but the
+    review's own author is absent from the cited reference. Returns None when the
+    record lists no authors (no signal to offer).
+    """
+    ref_words = _words(reference)
+    families = []
+    for a in work.get("author") or []:
+        # Family names can be multi-word ("Soto Bermant"); match on any token.
+        toks = [t for t in re.findall(r"\w+", (a.get("family") or "").lower()) if len(t) > 2]
+        if toks:
+            families.append(toks)
+    if not families:
+        return None
+    hits = sum(1 for toks in families if any(t in ref_words for t in toks))
+    return hits / len(families)
+
+
+def year_match(reference: str, work: dict) -> float | None:
+    """1.0 if the record's year is cited in the reference, 0.0 if it contradicts it.
+
+    Returns None when either side lacks a year. Catches reviews/reprints whose
+    year differs from the edition actually cited.
+    """
+    ref_years = set(re.findall(r"\b(?:1[5-9]\d\d|20\d\d)\b", reference))
+    parts = work.get("issued", {}).get("date-parts", [[None]])
+    work_year = parts[0][0] if parts and parts[0] else None
+    if not ref_years or work_year is None:
+        return None
+    return 1.0 if str(work_year) in ref_years else 0.0
+
+
+def match_score(reference: str, work: dict) -> float:
+    """Combined 0..1 confidence weighing title, author and year agreement.
+
+    Missing signals (no authors / no year) are dropped and the rest renormalized,
+    so records are judged only on the evidence they actually provide.
+    """
+    parts = [(title_confidence(reference, work), 2.0)]
+    au = author_overlap(reference, work)
+    if au is not None:
+        parts.append((au, 2.0))
+    yr = year_match(reference, work)
+    if yr is not None:
+        parts.append((yr, 1.0))
+    return sum(v * w for v, w in parts) / sum(w for _, w in parts)
+
+
+def pick_best(reference: str, works: list[dict]) -> dict | None:
+    """Choose the candidate that best agrees with the reference.
+
+    Re-ranks Crossref's results by match_score so a candidate whose authors or
+    year contradict the reference can't win on title overlap alone (e.g. a book
+    review beating the actual book). Ties keep Crossref's original ordering.
+    """
+    best, best_key = None, None
+    for rank, work in enumerate(works):
+        key = (match_score(reference, work), -rank)
+        if best_key is None or key > best_key:
+            best, best_key = work, key
+    return best
 
 
 def format_work(work: dict) -> str:
@@ -116,9 +188,12 @@ def format_work(work: dict) -> str:
     score = work.get("score", 0)
 
     authors = work.get("author") or []
-    author_str = ", ".join(
-        " ".join(filter(None, [a.get("given"), a.get("family")])) for a in authors
-    ) or "(no authors)"
+    author_str = (
+        ", ".join(
+            " ".join(filter(None, [a.get("given"), a.get("family")])) for a in authors
+        )
+        or "(no authors)"
+    )
 
     year = ""
     issued = work.get("issued", {}).get("date-parts", [[None]])
@@ -126,11 +201,13 @@ def format_work(work: dict) -> str:
         year = str(issued[0][0])
 
     container = (work.get("container-title") or [""])[0]
+    work_type = work.get("type", "")
 
     lines = [
         f"  Title:     {title}",
         f"  Authors:   {author_str}",
         f"  Year:      {year}",
+        f"  Type:      {work_type}" if work_type else None,
         f"  Published: {container}" if container else None,
         f"  Score:     {score:.1f}",
         f"  DOI:       {doi}",
@@ -140,8 +217,22 @@ def format_work(work: dict) -> str:
 
 
 def lookup(reference: str) -> dict | None:
-    """Normalize and look up a reference, returning the best Crossref work."""
-    return find_doi(reference)
+    """Look up a reference and return the best-agreeing Crossref work, or None."""
+    return pick_best(reference, find_doi(reference))
+
+
+def review_notes(reference: str, work: dict) -> list[str]:
+    """Reasons (if any) to manually verify a match, for the confidence warning."""
+    notes = []
+    t = title_confidence(reference, work)
+    if t < CONFIDENCE_THRESHOLD:
+        notes.append(f"title overlap {t:.0%}")
+    au = author_overlap(reference, work)
+    if au is not None and au < 0.5:
+        notes.append(f"author overlap {au:.0%}")
+    if year_match(reference, work) == 0.0:
+        notes.append("year differs from reference")
+    return notes
 
 
 def run_single(raw: str) -> int:
@@ -161,11 +252,11 @@ def run_single(raw: str) -> int:
         print("No match found.")
         return 1
 
-    conf = title_confidence(reference, work)
     print("Best match:")
     print(format_work(work))
-    if conf < CONFIDENCE_THRESHOLD:
-        print(f"\n  ⚠ Low confidence (title overlap {conf:.0%}) — verify this match.")
+    notes = review_notes(reference, work)
+    if notes:
+        print(f"\n  ⚠ Low confidence ({'; '.join(notes)}) — verify this match.")
     return 0
 
 
@@ -193,17 +284,20 @@ def run_batch(raw: str, delay: float = 0.2) -> int:
             flagged += 1
             continue
 
-        conf = title_confidence(reference, work)
+        notes = review_notes(reference, work)
+        conf = match_score(reference, work)
         score = work.get("score", 0)
         title = (work.get("title") or ["(no title)"])[0]
         doi = work.get("DOI", "(no DOI)")
-        status = "OK   " if conf >= CONFIDENCE_THRESHOLD else "CHECK"
-        if status.strip() != "OK":
+        status = "CHECK" if notes else "OK   "
+        if notes:
             flagged += 1
         doi_url = f"https://doi.org/{doi}" if doi != "(no DOI)" else doi
         print(f"[{i}] {status}  conf {conf:.0%}  score {score:.0f}")
         print(f"    in:  {reference[:90]}")
         print(f"    hit: {title[:90]}")
+        if notes:
+            print(f"    why: {'; '.join(notes)}")
         print(f"    doi: {doi_url}\n")
 
         if delay and i < len(references):
