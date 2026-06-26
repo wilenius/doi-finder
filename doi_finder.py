@@ -74,10 +74,13 @@ def split_references(text: str) -> list[str]:
     return entries
 
 
-def find_doi(reference: str, rows: int = 5, timeout: int = 30) -> list[dict]:
+def find_doi(reference: str, rows: int = 20, timeout: int = 30) -> list[dict]:
     """Query Crossref for a reference and return the candidate works (best first).
 
-    Returns Crossref's own relevance order; callers re-rank with pick_best.
+    Returns Crossref's own relevance order; callers re-rank with pick_best. The
+    pool is kept wide because a much-reviewed work (e.g. a popular book) can have
+    many reviews out-rank it in Crossref's order — the actual work must still be
+    in the candidates for pick_best to recover it.
     """
     params = {
         "query.bibliographic": reference,
