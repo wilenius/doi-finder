@@ -2,7 +2,7 @@
 
 Look up the DOI for a single bibliography reference using the [Crossref REST API](https://www.crossref.org/documentation/retrieve-metadata/rest-api/).
 
-## Crossref token?
+## Crossref API
 
 No token or registration needed — the Crossref REST API is free and public. The
 only courtesy is the "polite pool": including a contact email (`mailto`) routes
